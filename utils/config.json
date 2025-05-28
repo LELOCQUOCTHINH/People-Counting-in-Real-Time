@@ -5,7 +5,7 @@
     "url": "",
     "ALERT": false,
     "Threshold": 10,
-    "Thread": false,
+    "Thread": true,
     "Log": false,
     "Scheduler": false,
     "Timer": false
