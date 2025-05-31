@@ -18,8 +18,11 @@ import json
 import csv
 import cv2
 import psutil
+import signal
+import sys
 from picamera2 import Picamera2
 from queue import Queue, Empty
+from postTelemetry_mqtt_tb import MQTTThingsBoardClient
 
 # execution start time
 start_time = time.time()
@@ -52,7 +55,6 @@ class PiCameraThreadingClass:
         while self.running:
             with self.condition:
                 while self.q.full() and self.running:
-                    logger.debug("Queue full, read-thread waiting")
                     self.condition.wait()
                 if not self.running:
                     break
@@ -60,7 +62,6 @@ class PiCameraThreadingClass:
                 if frame is not None:
                     self.q.put(frame)
                     self.frame_count += 1
-                    logger.debug(f"Frame read successfully, frame {self.frame_count}, queue size: {self.q.qsize()}")
                 time.sleep(0.005)  # Small delay to prevent overwhelming the queue
 
     def read(self):
@@ -82,6 +83,40 @@ class PiCameraThreadingClass:
         self.camera.stop()
         logger.debug("PiCamera released")
 
+# Global variables for telemetry
+cpu_usages = []
+memory_usages = []
+temperatures = []
+fps_values = []
+tb_client = None
+running = True
+lock = threading.Lock()
+
+# Signal handler for Ctrl+C
+def signal_handler(sig, frame):
+    global running, tb_client, vs, writer
+    print("Ctrl+C detected, cleaning up...")
+    running = False
+    if vs is not None:
+        vs.release()
+    if tb_client:
+        tb_client.disconnect()
+    if writer is not None:
+        writer.release()
+    cv2.destroyAllWindows()
+    # Print average resource usage and FPS
+    if cpu_usages:
+        print(f"Average CPU Usage: {sum(cpu_usages)/len(cpu_usages):.2f}%")
+    if memory_usages:
+        print(f"Average Memory Usage: {sum(memory_usages)/len(memory_usages):.2f}%")
+    if temperatures:
+        print(f"Average Temperature: {sum(temperatures)/len(temperatures):.2f}°C")
+    if fps_values:
+        print(f"Average FPS: {sum(fps_values)/len(fps_values):.2f}")
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+
 def parse_arguments():
     # function to parse the arguments
     ap = argparse.ArgumentParser()
@@ -98,6 +133,12 @@ def parse_arguments():
         help="minimum probability to filter weak detections")
     ap.add_argument("-s", "--skip-frames", type=int, default=20,
         help="# of skip frames between detections")
+    ap.add_argument("--server-IP", type=str, default="",
+        help="ThingsBoard server domain")
+    ap.add_argument("-P", "--Port", type=int, default=0,
+        help="MQTT port for ThingsBoard server")
+    ap.add_argument("-a", "--token", type=str, default="",
+        help="Device access token for ThingsBoard authentication")
     args = vars(ap.parse_args())
     return args
 
@@ -117,9 +158,41 @@ def log_data(move_in, in_time, move_out, out_time):
             wr.writerow(("Move In", "In Time", "Move Out", "Out Time"))
             wr.writerows(export_data)
 
+def monitor_resources(tb_client, server_IP, port, token):
+    global cpu_usages, memory_usages, temperatures
+    last_time = time.time()
+    while running:
+        current_time = time.time()
+        if current_time - last_time >= 10:
+            cpu_usage = psutil.cpu_percent(interval=None)
+            memory_usage = psutil.virtual_memory().percent
+            try:
+                with open('/sys/class/thermal/thermal_zone0/temp', 'r') as f:
+                    temp = int(f.read()) / 1000.0
+            except:
+                temp = 0.0
+            with lock:
+                cpu_usages.append(cpu_usage)
+                memory_usages.append(memory_usage)
+                temperatures.append(temp)
+            tb_client.send_telemetry(server_IP, port, token, "CPU_usage", round(cpu_usage, 2))
+            tb_client.send_telemetry(server_IP, port, token, "memory_usage", round(memory_usage, 2))
+            tb_client.send_telemetry(server_IP, port, token, "Temperature", round(temp, 2))
+            last_time = current_time
+        time.sleep(1)
+
 def people_counter():
     # main function for people_counter.py
+    global tb_client, running, vs, writer
     args = parse_arguments()
+
+    if not args["server_IP"] or not args["Port"] or not args["token"]:
+        print("Error: --server-IP, --Port, and --token are required")
+        sys.exit(1)
+
+    # Initialize ThingsBoard client
+    tb_client = MQTTThingsBoardClient()
+
     # initialize the list of class labels MobileNet SSD was trained to detect
     CLASSES = ["background", "aeroplane", "bicycle", "bird", "boat",
                "bottle", "bus", "car", "cat", "chair", "cow", "diningtable",
@@ -187,14 +260,18 @@ def people_counter():
     # start the frames per second throughput estimator
     fps = FPS().start()
 
+    # Start resource monitoring thread
+    monitor_thread = threading.Thread(target=monitor_resources, args=(tb_client, args["server_IP"], args["Port"], args["token"]))
+    monitor_thread.daemon = True
+    monitor_thread.start()
+
+    # Initialize FPS calculation variables
+    fps_start_time = time.time()
+    fps_frames = 0
+
     try:
         # loop over frames from the video source
-        while True:
-            # monitor CPU and memory usage
-            cpu_usage = psutil.cpu_percent(interval=None)
-            memory_info = psutil.virtual_memory()
-            logger.debug(f"CPU Usage: {cpu_usage}%, Memory: {memory_info.percent}%")
-
+        while running:
             # record start time for frame processing
             frame_start_time = time.time()
 
@@ -240,7 +317,6 @@ def people_counter():
 
                 # convert the frame to a blob and pass the blob through the
                 # network and obtain the detections
-                logger.debug(f"Frame shape before blob: {frame.shape}")
                 blob = cv2.dnn.blobFromImage(frame, 0.007843, (W, H), 127.5)
                 net.setInput(blob)
                 detections = net.forward()
@@ -312,70 +388,80 @@ def people_counter():
             objects = ct.update(rects)
 
             # loop over the tracked objects
-            for (objectID, centroid) in objects.items():
-                # check to see if a trackable object exists for the current
-                # object ID
-                to = trackableObjects.get(objectID, None)
+            with lock:
+                for (objectID, centroid) in objects.items():
+                    # check to see if a trackable object exists for the current
+                    # object ID
+                    to = trackableObjects.get(objectID, None)
 
-                # if there is no existing trackable object, create one
-                if to is None:
-                    to = TrackableObject(objectID, centroid)
+                    # if there is no existing trackable object, create one
+                    if to is None:
+                        to = TrackableObject(objectID, centroid)
 
-                # otherwise, there is a trackable object so we can utilize it
-                # to determine direction
-                else:
-                    # the difference between the y-coordinate of the *current*
-                    # centroid and the mean of *previous* centroids will tell
-                    # us in which direction the object is moving (negative for
-                    # 'up' and positive for 'down')
-                    y = [c[1] for c in to.centroids]
-                    direction = centroid[1] - np.mean(y)
-                    to.centroids.append(centroid)
+                    # otherwise, there is a trackable object so we can utilize it
+                    # to determine direction
+                    else:
+                        # the difference between the y-coordinate of the *current*
+                        # centroid and the mean of *previous* centroids will tell
+                        # us in which direction the object is moving (negative for
+                        # 'up' and positive for 'down')
+                        y = [c[1] for c in to.centroids]
+                        direction = centroid[1] - np.mean(y)
+                        to.centroids.append(centroid)
 
-                    # check to see if the object has been counted or not
-                    if not to.counted:
-                        # if the direction is negative (indicating the object
-                        # is moving up) AND the centroid is above the center
-                        # line, count the object
-                        if direction < 0 and centroid[1] < H // 2:
-                            totalUp += 1
-                            date_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-                            move_out.append(totalUp)
-                            out_time.append(date_time)
-                            to.counted = True
+                        # check to see if the object has been counted or not
+                        if not to.counted:
+                            # if the direction is negative (indicating the object
+                            # is moving up) AND the centroid is above the center
+                            # line, count the object
+                            if direction < 0 and centroid[1] < H // 2:
+                                totalUp += 1
+                                date_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+                                move_out.append(totalUp)
+                                out_time.append(date_time)
+                                to.counted = True
+                                tb_client.send_telemetry(args["server_IP"], args["Port"], args["token"], "exited_people", totalUp)
+                                tb_client.send_telemetry(args["server_IP"], args["Port"], args["token"], "entered_people", totalDown)
+                                tb_client.send_telemetry(args["server_IP"], args["Port"], args["token"], "people_inside", totalDown - totalUp)
+                                logger.debug(f"Counted OUT: Total OUT = {totalUp}")
 
-                        # if the direction is positive (indicating the object
-                        # is moving down) AND the centroid is below the
-                        # center line, count the object
-                        elif direction > 0 and centroid[1] > H // 2:
-                            totalDown += 1
-                            date_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-                            move_in.append(totalDown)
-                            in_time.append(date_time)
-                            # if the people limit exceeds over threshold, send an email alert
-                            if sum(total) >= config["Threshold"]:
-                                cv2.putText(frame, "-ALERT: People limit exceeded-", (10, frame.shape[0] - 80),
-                                            cv2.FONT_HERSHEY_COMPLEX, 0.5, (0, 0, 255), 2)
-                                if config["ALERT"]:
-                                    logger.debug("Sending email alert..")
-                                    email_thread = threading.Thread(target=send_mail)
-                                    email_thread.daemon = True
-                                    email_thread.start()
-                                    logger.debug("Alert sent!")
-                            to.counted = True
+                            # if the direction is positive (indicating the object
+                            # is moving down) AND the centroid is below the center
+                            # line, count the object
+                            elif direction > 0 and centroid[1] > H // 2:
+                                totalDown += 1
+                                date_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+                                move_in.append(totalDown)
+                                in_time.append(date_time)
+                                # if the people limit exceeds over threshold, send an email alert
+                                if sum(total) >= config["Threshold"]:
+                                    cv2.putText(frame, "-ALERT: People limit exceeded-", (10, frame.shape[0] - 80),
+                                                cv2.FONT_HERSHEY_COMPLEX, 0.5, (0, 0, 255), 2)
+                                    if config["ALERT"]:
+                                        logger.debug("Sending email alert..")
+                                        email_thread = threading.Thread(target=send_mail)
+                                        email_thread.daemon = True
+                                        email_thread.start()
+                                        logger.debug("Alert sent!")
+                                to.counted = True
+                                tb_client.send_telemetry(args["server_IP"], args["Port"], args["token"], "entered_people", totalDown)
+                                tb_client.send_telemetry(args["server_IP"], args["Port"], args["token"], "exited_people", totalUp)
+                                tb_client.send_telemetry(args["server_IP"], args["Port"], args["token"], "people_inside", totalDown - totalUp)
+                                logger.debug(f"Counted IN: Total IN = {totalDown}")
+
                             # compute the sum of total people inside
                             # total = []
                             # total.append(len(move_in) - len(move_out))
 
-                # store the trackable object in our dictionary
-                trackableObjects[objectID] = to
+                    # store the trackable object in our dictionary
+                    trackableObjects[objectID] = to
 
-                # draw both the ID of the object and the centroid of the
-                # object on the output frame
-                text = "ID {}".format(objectID)
-                cv2.putText(frame, text, (centroid[0] - 10, centroid[1] - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-                cv2.circle(frame, (centroid[0], centroid[1]), 4, (255, 255, 255), -1)
+                    # draw both the ID of the object and the centroid of the
+                    # object on the output frame
+                    text = "ID {}".format(objectID)
+                    cv2.putText(frame, text, (centroid[0] - 10, centroid[1] - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+                    cv2.circle(frame, (centroid[0], centroid[1]), 4, (255, 255, 255), -1)
 
             # construct a tuple of information we will be displaying on the frame
             info_status = [
@@ -390,7 +476,6 @@ def people_counter():
             # ]
 
             # display the output
-            display_start_time = time.time()
             for (i, (k, v)) in enumerate(info_status):
                 text = "{}: {}".format(k, v)
                 cv2.putText(frame, text, (10, H - ((i * 20) + 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
@@ -408,24 +493,28 @@ def people_counter():
                 writer.write(frame)
 
             # show the output frame
-            logger.debug("Attempting to display frame...")
             cv2.imshow("Real-Time Monitoring/Analysis Window", frame)
             cv2.waitKey(100)  # Increased for GUI stability
-            logger.debug("Frame display attempted")
-            display_time = time.time() - display_start_time
-            logger.debug(f"Frame {totalFrames + 1} display time: {display_time:.3f} seconds")
             key = cv2.waitKey(1) & 0xFF
             # if the `q` key was pressed, break from the loop
             if key == ord("q"):
+                running = False
                 break
             # increment the total number of frames processed thus far and
             # then update the FPS counter
             totalFrames += 1
+            fps_frames += 1
             fps.update()
 
-            # log processing time
-            frame_time = time.time() - frame_start_time
-            logger.debug(f"Frame {totalFrames} processing time: {frame_time:.3f} seconds")
+            # Send FPS telemetry every 10 seconds
+            with lock:
+                elapsed_time = time.time() - fps_start_time
+                if elapsed_time >= 10:
+                    current_fps = fps_frames / elapsed_time if elapsed_time > 0 else 0
+                    fps_values.append(current_fps)
+                    tb_client.send_telemetry(args["server_IP"], args["Port"], args["token"], "FPS", round(current_fps, 2))
+                    fps_start_time = time.time()
+                    fps_frames = 0
 
             # initiate the timer
             if config["Timer"]:
@@ -433,6 +522,7 @@ def people_counter():
                 end_time = time.time()
                 num_seconds = (end_time - start_time)
                 if num_seconds > 28800:
+                    running = False
                     break
 
     finally:
@@ -451,6 +541,19 @@ def people_counter():
 
         # close any open windows
         cv2.destroyAllWindows()
+        if tb_client:
+            tb_client.disconnect()
+        if writer is not None:
+            writer.release()
+        # Print average resource usage and FPS
+        if cpu_usages:
+            print(f"Average CPU Usage: {sum(cpu_usages)/len(cpu_usages):.2f}%")
+        if memory_usages:
+            print(f"Average Memory Usage: {sum(memory_usages)/len(memory_usages):.2f}%")
+        if temperatures:
+            print(f"Average Temperature: {sum(temperatures)/len(temperatures):.2f}°C")
+        if fps_values:
+            print(f"Average FPS: {sum(fps_values)/len(fps_values):.2f}")
 
 # initiate the scheduler
 if config["Scheduler"]:

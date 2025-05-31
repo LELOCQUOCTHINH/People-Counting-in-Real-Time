@@ -34,23 +34,23 @@ class ThreadingClass:
         while self.running and retry_count < max_retries:
             with self.condition:
                 while self.q.full() and self.running:
-                    logger.debug("Queue full, read-thread waiting")
+                    # logger.debug("Queue full, read-thread waiting")
                     self.condition.wait()
                 if not self.running:
                     break
                 ret, frame = self.cap.read()
                 if not ret or frame is None:
                     retry_count += 1
-                    logger.warning(f"Failed to read frame from video source (attempt {retry_count}/{max_retries})")
+                    # logger.warning(f"Failed to read frame from video source (attempt {retry_count}/{max_retries})")
                     time.sleep(0.5)
                     continue
                 self.q.put(frame)
                 self.frame_count += 1
-                logger.debug(f"Frame read successfully, frame {self.frame_count}, queue size: {self.q.qsize()}")
+                # logger.debug(f"Frame read successfully, frame {self.frame_count}, queue size: {self.q.qsize()}")
                 retry_count = 0
                 time.sleep(0.005)
         if retry_count >= max_retries:
-            logger.error("Max retries reached, stopping reader thread")
+            # logger.error("Max retries reached, stopping reader thread")
             self.running = False
 
     def read(self):
